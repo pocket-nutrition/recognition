@@ -15,7 +15,7 @@ The mobile apps ([iOS](https://github.com/pocket-nutrition/ios), [Android](https
 
 Tickets live in memory only and expire after 48 hours by default. A restart drops all of them, and the apps treat a 404 as "gone". Until a worker connects, uploads simply stay `queued`.
 
-More in the docs: [Run the platform: voice and photo](https://website.pocketnutrition.org/docs/self-hosting/run-the-platform#voice-and-photo) and the [architecture overview](https://website.pocketnutrition.org/docs/architecture/overview). [`CLAUDE.md`](CLAUDE.md) has the full contract (routes, authentication, statuses, invariants).
+[`CLAUDE.md`](CLAUDE.md) has the full contract (routes, authentication, statuses, invariants).
 
 ## Prerequisites
 

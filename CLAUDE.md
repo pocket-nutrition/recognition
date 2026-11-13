@@ -96,4 +96,4 @@ Container image: `ghcr.io/pocket-nutrition/recognition` (built from the `Dockerf
 
 ## Docs and contributing
 
-[Run the platform: voice and photo](https://website.pocketnutrition.org/docs/self-hosting/run-the-platform#voice-and-photo) · [Architecture overview](https://website.pocketnutrition.org/docs/architecture/overview) · See [CONTRIBUTING.md](CONTRIBUTING.md) for the PR workflow, CI (`.github/workflows/ci.yml`) and CalVer releases.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the PR workflow, CI (`.github/workflows/ci.yml`) and CalVer releases.
