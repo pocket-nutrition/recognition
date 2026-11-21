@@ -6,14 +6,14 @@ from nacl.public import PrivateKey
 
 from app.config import Settings
 from app.main import create_app
-from tests.conftest import AUDIO
+from tests.conftest import AUDIO, WORKER, WORKER_KEY
 
 TOKEN = "pnv_drop-token-aaaa"
 PUBLIC_KEY = base64.b64encode(bytes(PrivateKey.generate().public_key)).decode()
 
 
 class FakeVault:
-    """Answers GET /v1/me like the real vault does for a drop token, and PUT /v1/drop."""
+    """Answers GET /v1/me like the real vault does for a drop token."""
 
     def __init__(self, role="dropper", me_status=200):
         self.role = role
@@ -26,7 +26,7 @@ class FakeVault:
             if self.me_status != 200:
                 return httpx.Response(self.me_status, json={"detail": "nope"})
             return httpx.Response(200, json={"account_id": "acc-1", "role": self.role, "scope_id": None})
-        return httpx.Response(200, json={"remaining_writes": 0})
+        return httpx.Response(404)
 
     def me_calls(self) -> list[httpx.Request]:
         return [c for c in self.calls if c.url.path == "/v1/me"]
@@ -36,9 +36,8 @@ def make_app(vault: FakeVault, **overrides):
     settings = Settings(
         api_key=overrides.pop("api_key", None),
         trusted_vaults=overrides.pop("trusted_vaults", "vault.test"),
+        worker_key=WORKER_KEY,
         vault_allow_insecure=True,
-        default_delay_s=0.03,
-        vault_retry_delays_s=(0.01,),
         **overrides,
     )
     return create_app(settings, vault_transport=httpx.MockTransport(vault))
@@ -87,7 +86,7 @@ async def test_a_valid_drop_token_is_enough_and_the_vault_is_asked_with_that_tok
 async def test_without_a_drop_or_a_key_nothing_is_accepted(setup):
     client, vault = setup
     resp = await client.post("/captures", files=AUDIO)
-    assert resp.status_code == 401
+    assert resp.status_code == 422
     assert vault.calls == []
 
 
@@ -132,7 +131,7 @@ async def test_a_vault_that_does_not_answer_is_a_retryable_503():
         raise httpx.ConnectError("down")
 
     settings = Settings(
-        api_key=None, trusted_vaults="vault.test", vault_allow_insecure=True, vault_retry_delays_s=(0.01,)
+        api_key=None, trusted_vaults="vault.test", vault_allow_insecure=True, worker_key=WORKER_KEY
     )
     app = create_app(settings, vault_transport=httpx.MockTransport(boom))
     async with app.router.lifespan_context(app), client_for(app) as client:
@@ -144,7 +143,7 @@ async def test_the_api_key_still_works_without_asking_the_vault():
     vault = FakeVault(me_status=401)
     app = make_app(vault, api_key="legacy-key-0123456789")
     async with app.router.lifespan_context(app), client_for(app) as client:
-        resp = await client.post("/captures", headers=bearer("legacy-key-0123456789"), files=AUDIO)
+        resp = await client.post("/captures", headers=bearer("legacy-key-0123456789"), files=AUDIO, data=drop_form())
         assert resp.status_code == 202
         assert vault.me_calls() == []
 
@@ -219,14 +218,13 @@ async def test_the_whole_dictation_works_without_any_api_key():
     app = make_app(vault)
     async with app.router.lifespan_context(app), client_for(app) as client:
         created = (await client.post("/captures", files=AUDIO, data=drop_form())).json()
-        for _ in range(100):
-            body = (
-                await client.get(f"/captures/{created['id']}?wait=1", headers=bearer(created["secret"]))
-            ).json()
-            if body["status"] in ("done", "failed"):
-                break
+        job = (await client.post("/worker/claim", headers=WORKER)).json()
+        assert job["drop"]["token"] == TOKEN
+        await client.post(f"/worker/leases/{job['lease_id']}/complete", headers=WORKER, json={"delivery": "delivered"})
+        body = (await client.get(f"/captures/{created['id']}", headers=bearer(created["secret"]))).json()
         assert body["status"] == "done" and body["delivery"] == "delivered"
-        assert [c for c in vault.calls if c.url.path == "/v1/drop"]
+        # The service only ever asked the vault about the token; it never deposited anything itself.
+        assert {c.url.path for c in vault.calls} == {"/v1/me"}
 
 
 # --- configuration -------------------------------------------------------------------------------
@@ -234,13 +232,13 @@ async def test_the_whole_dictation_works_without_any_api_key():
 
 def test_some_way_to_authenticate_is_required():
     with pytest.raises(ValueError):
-        Settings(api_key=None)
-    Settings(api_key="legacy-key-0123456789")
-    Settings(api_key=None, trusted_vaults="vault.example")
+        Settings(api_key=None, worker_key=WORKER_KEY)
+    Settings(api_key="legacy-key-0123456789", worker_key=WORKER_KEY)
+    Settings(api_key=None, trusted_vaults="vault.example", worker_key=WORKER_KEY)
 
 
 def test_trusted_vaults_are_a_clean_set_of_lowercase_hosts():
-    settings = Settings(api_key=None, trusted_vaults=" Vault.Example , other.example ,")
+    settings = Settings(api_key=None, trusted_vaults=" Vault.Example , other.example ,", worker_key=WORKER_KEY)
     assert settings.trusted_vault_hosts == frozenset({"vault.example", "other.example"})
 
 
@@ -253,20 +251,3 @@ async def test_an_unusable_inbox_key_is_refused_up_front(setup, key):
     form = {**drop_form(), "inbox_public_key": base64.b64encode(key).decode()}
     resp = await client.post("/captures", files=AUDIO, data=form)
     assert resp.status_code == 422
-
-
-async def test_a_crash_while_delivering_finishes_the_ticket_with_the_result_kept():
-    from app.store import TicketStore
-
-    async def crash(target, payload):
-        raise RuntimeError("boom")
-
-    store = TicketStore(ttl_s=3600, tombstone_ttl_s=3600, deliver=crash)
-    ticket = store.create()
-    from app.vault import DropTarget
-
-    ticket.drop = DropTarget(url="http://v", token="t", inbox_public_key=bytes(32), record_id="r")
-    store.start(ticket, 0.03, __import__("app.schemas", fromlist=["Status"]).Status.done)
-    await store.wait_for_terminal(ticket, 3)
-    assert ticket.status.value == "done"
-    assert ticket.delivery == "failed" and ticket.result is not None

@@ -3,6 +3,9 @@
 The worker authenticates with its own key (never the phone key). It only ever calls out to this
 service: claim a job (long poll), download its audio, report progress, then complete or fail it.
 A job is held under a lease; a worker that goes silent loses it and the job is requeued.
+
+There is no way to send a result here: the worker seals it into the user's vault, then reports
+`delivered`. A deposit that fails is reported as a failure.
 """
 
 import base64
@@ -10,10 +13,10 @@ import hmac
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.config import Settings
-from app.schemas import CaptureResult, Status
+from app.schemas import Status
 from app.store import LeaseLost, Ticket, TicketStore
 
 router = APIRouter(prefix="/worker")
@@ -51,7 +54,7 @@ class JobOut(BaseModel):
     ticket_id: str
     lease_expires_at: float
     audio_content_type: str
-    drop: DropOut | None = None
+    drop: DropOut
 
 
 class ProgressIn(BaseModel):
@@ -59,8 +62,10 @@ class ProgressIn(BaseModel):
 
 
 class CompleteIn(BaseModel):
-    delivery: Literal["none", "delivered", "failed"]
-    result: CaptureResult | None = None
+    # Anything else, a `result` above all, is refused: results never come back to this service.
+    model_config = ConfigDict(extra="forbid")
+
+    delivery: Literal["delivered"]
 
 
 class FailIn(BaseModel):
@@ -74,8 +79,7 @@ def _job(ticket: Ticket) -> JobOut:
         ticket_id=ticket.id,
         lease_expires_at=ticket.lease_expires_at,
         audio_content_type=ticket.audio_type,
-        drop=drop
-        and DropOut(
+        drop=DropOut(
             url=drop.url,
             token=drop.token,
             record_id=drop.record_id,
@@ -122,18 +126,9 @@ async def progress(lease_id: str, body: ProgressIn, store: Annotated[TicketStore
 
 @router.post("/leases/{lease_id}/complete", status_code=204, dependencies=[Auth])
 async def complete(lease_id: str, body: CompleteIn, store: Annotated[TicketStore, Depends(_store)]):
-    """Finish a job. If the worker sealed the result into the vault (`delivered`) it must not send it
-    here; otherwise the result is kept on the ticket for the phone to fetch."""
-    ticket = _leased(store, lease_id)
-    if ticket.drop is None and body.delivery != "none":
-        raise HTTPException(status_code=422, detail="no vault drop was requested for this job")
-    if ticket.drop is not None and body.delivery == "none":
-        raise HTTPException(status_code=422, detail="a vault drop was requested: report delivered or failed")
-    if body.delivery == "delivered" and body.result is not None:
-        raise HTTPException(status_code=422, detail="a delivered result must not be sent here")
-    if body.delivery != "delivered" and body.result is None:
-        raise HTTPException(status_code=422, detail="result required unless it was delivered")
-    await store.finish(lease_id, body.delivery, body.result)
+    """Finish a job whose sealed result is already in the user's vault."""
+    _leased(store, lease_id)
+    await store.finish(lease_id)
     return Response(status_code=204)
 
 

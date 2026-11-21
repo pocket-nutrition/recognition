@@ -2,24 +2,24 @@
 
 Meal recognition server for [Pocket Nutrition](https://github.com/pocket-nutrition): queues voice recordings and plate photos in memory until a worker processes them.
 
-The mobile apps ([iOS](https://github.com/pocket-nutrition/ios), [Android](https://github.com/pocket-nutrition/android)) upload a voice recording or a photo of a meal, get a **ticket** back, and poll it for the extracted ingredient candidates.
+The mobile apps ([iOS](https://github.com/pocket-nutrition/ios), [Android](https://github.com/pocket-nutrition/android)) upload a voice recording or a photo of a meal, get a **ticket** back, poll it until the job is done, then collect the extracted ingredient candidates from their [vault](https://github.com/pocket-nutrition/vault).
 
-**This server does not process anything itself.** It does no speech-to-text, no photo analysis and no ingredient extraction. It authenticates the upload, holds it in memory, hands it to a worker and keeps track of the ticket's status. The processing happens in the worker.
+**This server does not process anything itself, and results never pass through it.** It does no speech-to-text, no photo analysis and no ingredient extraction. It authenticates the upload, holds it in memory, hands it to a worker and keeps track of the ticket's status. The processing happens in the worker, and the result goes straight from the worker to the user's vault.
 
 ## Where it fits
 
-1. The app uploads the recording or photo to `POST /captures` and gets a ticket.
-2. In `worker` mode, which is how a deployed server runs, the job waits in an in-memory queue until a worker pulls it. The worker is a separate project, [`recognition-worker-osx`](https://github.com/pocket-nutrition/recognition-worker-osx), a process that runs on a Mac you control. It only makes outbound calls, so nothing on the Mac is exposed to the internet. It runs speech-to-text or photo analysis, extracts the ingredients and reports back.
-3. When the app has set up a [vault](https://github.com/pocket-nutrition/vault), the worker seals the result to the phone's public key and deposits it there, and this server does not keep it. Otherwise the worker sends the result to this server, which keeps it on the ticket.
-4. The app polls the ticket (long polling is supported) and imports the ingredient candidates once its status is `done`.
+1. The app uploads the recording or photo to `POST /captures`, together with its vault drop target (the vault URL, a write-only drop token, a record id and the phone's inbox public key), and gets a ticket.
+2. The job waits in an in-memory queue until a worker pulls it. The worker is a separate project, [`recognition-worker-osx`](https://github.com/pocket-nutrition/recognition-worker-osx), a process that runs on a Mac you control. It only makes outbound calls, so nothing on the Mac is exposed to the internet. It runs speech-to-text or photo analysis and extracts the ingredients.
+3. The worker seals the result to the phone's inbox public key, deposits it in the user's vault and tells this server it is delivered. The server only records the status: it never receives the result.
+4. The app polls the ticket (long polling is supported). Once its status is `done`, the result is already in the vault: the app collects it from there and imports the ingredient candidates.
 
 Tickets live in memory only and expire after 48 hours by default. A restart drops all of them, and the apps treat a 404 as "gone". Until a worker connects, uploads simply stay `queued`.
 
-More in the docs: [Run the platform: voice and photo](https://website.pocketnutrition.org/docs/self-hosting/run-the-platform#voice-and-photo) and the [architecture overview](https://website.pocketnutrition.org/docs/architecture/overview). [`CLAUDE.md`](CLAUDE.md) has the full contract (routes, authentication, statuses, invariants).
+[`CLAUDE.md`](CLAUDE.md) has the full contract (routes, authentication, statuses, invariants).
 
 ## Prerequisites
 
-- Python 3.12 (matches the `python:3.12-slim` base image in the [Dockerfile](Dockerfile))
+- Python 3.12 or later for local development (`./setup.sh` uses `python3.12`, and CI runs the tests on 3.12; the container image in the [Dockerfile](Dockerfile) uses `python:3.15-slim`)
 - `pip`
 - Docker, only if you run the container image
 
@@ -31,7 +31,7 @@ cd recognition
 ./setup.sh                  # creates .venv, installs dependencies, copies .env.example to .env
 ```
 
-Then fill in **both keys** in `.env` (`openssl rand -hex 32` makes a good one): `RECOGNITION_API_KEY` and `RECOGNITION_WORKER_KEY`. The server refuses to start in worker mode without a valid worker key. See [Configuration](#configuration).
+Then fill in **both keys** in `.env` (`openssl rand -hex 32` makes a good one): `RECOGNITION_API_KEY` and `RECOGNITION_WORKER_KEY`. The server refuses to start without a valid worker key. See [Configuration](#configuration).
 
 Start the server from a subshell, so the variables stay out of your terminal, and check it:
 
@@ -45,20 +45,27 @@ curl localhost:8000/health        # {"status":"ok"}
 
 Then start a worker against it, with the same worker key: see [`recognition-worker-osx`](https://github.com/pocket-nutrition/recognition-worker-osx).
 
-### Local development without a worker
+### Trying the API
 
-To try the API or develop a client without a worker, run the simulator pipeline. It returns the same fixed sample result for every upload, whatever the recording or photo contains, after a short delay. It is for development and tests only, not a way to run the service.
+Every upload names the vault drop its result goes to: an `https` vault on a public address, a write-only drop token minted by that vault, the record id the result is stored under, and the phone's inbox public key (base64 X25519). A missing or malformed field is refused with 422, with or without the API key.
+
+With a server started on throwaway keys:
 
 ```bash
-RECOGNITION_PIPELINE=simulator RECOGNITION_API_KEY=dev .venv/bin/uvicorn app.main:build --factory --reload --port 8000
+RECOGNITION_API_KEY=dev RECOGNITION_WORKER_KEY=dev-worker-key-0123456789 .venv/bin/uvicorn app.main:build --factory --reload --port 8000
 ```
 
+upload a recording, then long-poll its ticket until a worker has delivered the result to the vault:
+
 ```bash
-curl -H 'Authorization: Bearer dev' -F "audio=@meal.m4a;type=audio/mp4" localhost:8000/captures
+curl -H 'Authorization: Bearer dev' -F "audio=@meal.m4a;type=audio/mp4" \
+  -F vault_url=https://vault.example -F vault_token=<drop token> \
+  -F vault_record_id=<record id> -F inbox_public_key=<base64 X25519> \
+  localhost:8000/captures
 curl -H 'Authorization: Bearer dev' "localhost:8000/captures/<id>?wait=20&known_status=queued"
 ```
 
-`dev` is only a throwaway key for trying things locally; use long random ones anywhere else.
+`dev` and `dev-worker-key-0123456789` are only throwaway keys for trying things locally; use long random ones anywhere else.
 
 ## Configuration
 
@@ -73,11 +80,9 @@ The server does not read `.env` by itself: export the variables (`set -a; . ./.e
 Fill in both keys before the first start:
 
 - `RECOGNITION_API_KEY`: a shared key, sent as `Authorization: Bearer <key>`. The simplest way to authenticate when you self-host.
-- `RECOGNITION_WORKER_KEY`: the secret the worker presents on the `/worker/*` routes, 16 characters or more and different from the API key. In worker mode the server refuses to start without it.
+- `RECOGNITION_WORKER_KEY`: the secret the worker presents on the `/worker/*` routes, 16 characters or more and different from the API key. The server refuses to start without it.
 
 Instead of an API key you can set `RECOGNITION_TRUSTED_VAULTS`: comma-separated hostnames of vaults whose write-only drop tokens authenticate a capture, so the apps need no key. The instance used by the public apps is `https://recognition.pocketnutrition.org`. At least one of the two is required, or the server refuses to start.
-
-`.env.example` sets `RECOGNITION_PIPELINE=worker`: jobs wait for a worker on a Mac. Keep that line. When the variable is missing, the server starts the simulator instead, which only returns a fixed sample result.
 
 Run a single replica: tickets are held in memory and are lost when the process stops.
 
@@ -111,10 +116,10 @@ Run the tests in a shell where no `RECOGNITION_*` variable is exported: they rel
 | Route | Purpose |
 |-------|---------|
 | `GET /health` | Liveness, no credentials |
-| `POST /captures` | Upload a recording or a photo (multipart field `audio`); answers with a ticket and its secret |
-| `GET /captures/{id}` | Read a ticket; `?wait=N&known_status=S` long-polls |
+| `POST /captures` | Upload a recording or a photo (multipart field `audio`) with the four vault fields; answers with a ticket and its secret |
+| `GET /captures/{id}` | Read a ticket's status (never a result); `?wait=N&known_status=S` long-polls |
 | `DELETE /captures/{id}` | Delete a ticket |
-| `/worker/*` | Worker mode only, with the worker key: claim a job, download it, report progress, complete or fail it |
+| `/worker/*` | With the worker key only: claim a job, download it, report progress, report it delivered or failed |
 
 ## Using with Claude Code
 

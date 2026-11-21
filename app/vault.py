@@ -1,15 +1,14 @@
-"""Deliver finished captures to the user's vault as sealed, write-only drops.
+"""The vault drop target a capture carries, and the one call this service makes to a vault.
 
-The service never holds a key that can read what it deposits: the payload is sealed to the phone's
-public key and the drop token only allows one narrow write. Nothing sent is kept in the ticket.
+The worker seals the result to the phone's public key and deposits it with the write-only drop token;
+this service never deposits, never reads, and never sees a result. It only checks the target's shape
+(https, public address, usable key) and asks the vault whether the drop token is alive.
 """
 
 import asyncio
 import base64
 import binascii
 import ipaddress
-import json
-import logging
 import socket
 from dataclasses import dataclass
 from urllib.parse import urlsplit
@@ -19,10 +18,6 @@ from nacl.exceptions import CryptoError
 from nacl.public import PublicKey, SealedBox
 
 from app.config import Settings
-
-log = logging.getLogger(__name__)
-
-PAYLOAD_VERSION = 1
 
 
 class InvalidDropTarget(ValueError):
@@ -69,40 +64,10 @@ async def check_vault_url(url: str, settings: Settings) -> str:
     return f"{parts.scheme}://{parts.netloc}"
 
 
-def seal(payload: dict, inbox_public_key: bytes) -> str:
-    plaintext = json.dumps(payload, separators=(",", ":")).encode()
-    return base64.b64encode(SealedBox(PublicKey(inbox_public_key)).encrypt(plaintext)).decode()
-
-
-class VaultDeliverer:
+class VaultVerifier:
     def __init__(self, settings: Settings, transport: httpx.AsyncBaseTransport | None = None):
         self._settings = settings
         self._transport = transport
-
-    async def deliver(self, target: DropTarget, payload: dict) -> bool:
-        """Seal and deposit the payload. Returns False when it could not be delivered."""
-        body = {"ciphertext": seal(payload, target.inbox_public_key)}
-        headers = {"Authorization": f"Bearer {target.token}"}
-        delays = self._settings.vault_retry_delays_s
-        async with httpx.AsyncClient(
-            transport=self._transport, timeout=self._settings.vault_timeout_s, follow_redirects=False
-        ) as client:
-            for attempt in range(len(delays) + 1):
-                try:
-                    resp = await client.put(f"{target.url}/v1/drop", json=body, headers=headers)
-                except httpx.HTTPError as exc:
-                    log.warning("vault delivery attempt %d failed: %s", attempt + 1, type(exc).__name__)
-                else:
-                    if resp.status_code == 200:
-                        return True
-                    if resp.status_code < 500:
-                        # Expired, exhausted or revoked token: retrying cannot help.
-                        log.warning("vault rejected drop with %d", resp.status_code)
-                        return False
-                if attempt < len(delays):
-                    await asyncio.sleep(delays[attempt])
-        return False
-
 
     async def verify_drop_token(self, target: DropTarget) -> bool:
         """Whether the vault knows this token as a live drop token (`GET /v1/me` answers `role: dropper`).

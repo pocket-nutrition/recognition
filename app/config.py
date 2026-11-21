@@ -1,5 +1,3 @@
-from typing import Literal
-
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -12,9 +10,7 @@ class Settings(BaseSettings):
     # Comma-separated vault hostnames whose drop tokens authenticate a dictation (no key to type). The
     # recognition service asks that vault whether the token is alive; it never holds a key that reads.
     trusted_vaults: str = ""
-    # "simulator": static result after a delay. "worker": jobs wait in a queue for a remote worker.
-    pipeline: Literal["simulator", "worker"] = "simulator"
-    # Separate credential for the worker routes; the phone key must never work there.
+    # Credential of the remote worker that pulls jobs; the phone key must never work on its routes.
     worker_key: str | None = None
     lease_s: float = 120
     max_attempts: int = 3
@@ -26,12 +22,9 @@ class Settings(BaseSettings):
     sync_timeout_s: float = 30
     max_wait_s: float = 25
     max_audio_bytes: int = 10 * 1024 * 1024
-    default_delay_s: float = 6
-    max_delay_s: float = 120
     sweep_interval_s: float = 30
-    # Delivery of finished captures to the user's vault.
+    # Checking a drop token with the user's vault (`GET /v1/me`).
     vault_timeout_s: float = 10
-    vault_retry_delays_s: tuple[float, ...] = (1, 5, 30)
     # Tests only: allow http and non-public hosts.
     vault_allow_insecure: bool = False
 
@@ -43,9 +36,8 @@ class Settings(BaseSettings):
     def _check_worker_key(self) -> "Settings":
         if not self.api_key and not self.trusted_vault_hosts:
             raise ValueError("set api_key or trusted_vaults: some way to authenticate is required")
-        if self.pipeline == "worker":
-            if not self.worker_key or len(self.worker_key) < 16:
-                raise ValueError("worker_key must be set and at least 16 characters in worker mode")
-            if self.worker_key == self.api_key:
-                raise ValueError("worker_key must differ from api_key")
+        if not self.worker_key or len(self.worker_key) < 16:
+            raise ValueError("worker_key must be set and at least 16 characters")
+        if self.worker_key == self.api_key:
+            raise ValueError("worker_key must differ from api_key")
         return self

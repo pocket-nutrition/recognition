@@ -24,25 +24,20 @@ pip install -r requirements-dev.txt
 cp .env.example .env             # then fill in RECOGNITION_API_KEY and RECOGNITION_WORKER_KEY
 ```
 
-Run the service with the simulator pipeline. It returns the same fixed sample result for every upload, so
-you can work on the API and on clients without a worker (development and tests only):
+Run the service with throwaway keys. The worker key must be 16 characters or more and different from the
+API key, otherwise the server refuses to start:
 
 ```bash
-RECOGNITION_PIPELINE=simulator RECOGNITION_API_KEY=dev uvicorn app.main:build --factory --reload --port 8000
-```
-
-To work on the worker side, run in worker mode, which is how a deployed server runs. The worker key must be
-16 characters or more and different from the API key, otherwise the server refuses to start:
-
-```bash
-RECOGNITION_PIPELINE=worker RECOGNITION_API_KEY=dev RECOGNITION_WORKER_KEY=dev-worker-key-0123456789 \
-  uvicorn app.main:build --factory --reload --port 8000
+RECOGNITION_API_KEY=dev RECOGNITION_WORKER_KEY=dev-worker-key-0123456789 .venv/bin/uvicorn app.main:build --factory --reload --port 8000
 ```
 
 Then connect [`recognition-worker-osx`](https://github.com/pocket-nutrition/recognition-worker-osx), or play the
-worker by hand: upload a file to `POST /captures`, then
+worker by hand: upload a file to `POST /captures` with the four vault fields (`vault_url`, `vault_token`,
+`vault_record_id`, `inbox_public_key`; the README has a `curl` example), then
 `curl -X POST -H 'Authorization: Bearer dev-worker-key-0123456789' 'localhost:8000/worker/claim?wait=5'`
-hands you the job. The "Worker routes" section of [CLAUDE.md](CLAUDE.md) lists the rest of the calls.
+hands you the job, and `POST /worker/leases/<lease>/complete` with `{"delivery": "delivered"}` marks it done.
+Without a worker, tickets stay `queued`: the server has no way to produce a result itself. The "Worker routes"
+section of [CLAUDE.md](CLAUDE.md) lists the rest of the calls.
 
 The server does not read `.env` by itself. To use it, load it in a subshell so the variables do not leak
 into your terminal: `(set -a; . ./.env; set +a; exec uvicorn app.main:build --factory --port 8000)`.
@@ -54,8 +49,7 @@ pytest -v
 ```
 
 Run the tests in a shell where no `RECOGNITION_*` variable is exported. The tests rely on the built-in
-defaults, and exported variables change them (for example `RECOGNITION_PIPELINE=worker` makes most of the
-suite fail).
+defaults, and exported variables change them.
 
 There is no code coverage gate or linter configuration in this repository: keep changes consistent with the
 surrounding style (type hints on function signatures, English identifiers and comments, a comment where the
@@ -63,10 +57,9 @@ reason for a choice is not obvious).
 
 | File | Covers |
 |------|--------|
-| `tests/test_captures.py` | Ticket lifecycle on the simulator pipeline: statuses, long polling, sync mode, expiry, deletion |
-| `tests/test_vault_auth.py` | Authentication with drop tokens and ticket secrets, startup checks on the settings |
-| `tests/test_vault_delivery.py` | Sealing and depositing results into a vault, SSRF protection |
-| `tests/test_worker_queue.py` | Worker mode: the queue, leases, retries and the `/worker/*` routes |
+| `tests/test_captures.py` | Phone-facing routes: required vault fields and SSRF protection on `vault_url`, accepted media and size, long polling, sync mode, expiry, deletion |
+| `tests/test_vault_auth.py` | Authentication with drop tokens and ticket secrets, inbox key validation, startup checks on the settings |
+| `tests/test_worker_queue.py` | The queue, leases, retries, queue bounds, the `/worker/*` routes, and the rule that a worker can only report `delivered`, never a result |
 
 ## Test-first expectations
 
@@ -85,12 +78,12 @@ Read the "Invariants" section of [CLAUDE.md](CLAUDE.md) before touching the stor
 routes. In short:
 
 - Tickets and recordings live in memory only, in a single replica. Nothing is written to disk or to a database.
-- The service never holds a key that can read the vault. It only deposits sealed payloads with write-only
-  drop tokens.
+- The service never holds, receives or stores a result: the worker seals it and deposits it in the vault,
+  and the service only learns `delivered`.
+- The service never holds a key that can read the vault. Its only call to a vault checks a write-only drop
+  token (`GET /v1/me`).
 - Nothing may reveal whether a worker is connected.
 - `vault_url` comes from a phone: it stays https and public-address only, with no redirects.
-- A deployed server runs in worker mode. The simulator is a development and test aid, never a way to run
-  the service.
 
 ## Branch and PR workflow
 
@@ -103,7 +96,7 @@ routes. In short:
 ## Reporting issues
 
 Please open a GitHub issue using the bug report template. Include the request you sent (the route and form
-fields, not the file), the status code and body you got back, the pipeline (`worker` or `simulator`) and the
+fields, not the file), the status code and body you got back, and the
 version you run. Tickets live in memory and expire after 48 hours by default, so a ticket that is gone after a
 restart is expected (404), not a bug.
 

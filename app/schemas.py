@@ -14,36 +14,17 @@ class Status(str, Enum):
 TERMINAL = {Status.done, Status.failed}
 
 
-class Candidate(BaseModel):
-    ingredient_id: str
-    name: str
-    score: float
-
-
-class ExtractedItem(BaseModel):
-    raw_text: str
-    quantity: float | None = None
-    unit: str | None = None
-    cooking_method: str | None = None
-    candidates: list[Candidate]
-
-
-class CaptureResult(BaseModel):
-    transcript: str
-    language: str
-    items: list[ExtractedItem]
-
-
 class TicketOut(BaseModel):
+    """A ticket carries a status, never a result: the worker seals the result into the user's vault."""
+
     id: str
     status: Status
     created_at: float
     updated_at: float
     expires_at: float
-    result: CaptureResult | None = None
     error: str | None = None
-    # "delivered": the result was sealed into the vault and is no longer kept here.
-    delivery: str = "none"  # none | delivered | failed
+    # "delivered" once `done`: the result is in the vault, sealed for the phone. "none" before that.
+    delivery: str = "none"
 
 
 class TicketCreated(TicketOut):

@@ -1,18 +1,14 @@
 import asyncio
 import hashlib
 import hmac
-import logging
 import secrets
 import time
 import uuid
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
-from app.schemas import TERMINAL, CaptureResult, Status, TicketOut
-from app.simulator import static_result
-from app.vault import PAYLOAD_VERSION, DropTarget
+from app.schemas import TERMINAL, Status, TicketOut
+from app.vault import DropTarget
 
-log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -24,11 +20,9 @@ class Ticket:
     secret: str = field(default_factory=lambda: secrets.token_urlsafe(32), repr=False)
     status: Status = Status.queued
     updated_at: float = 0.0
-    result: CaptureResult | None = None
     error: str | None = None
     delivery: str = "none"
     drop: DropTarget | None = field(default=None, repr=False)
-    task: asyncio.Task | None = field(default=None, repr=False)
     # Worker pipeline: the audio waits here (memory only) until a worker finishes the job.
     audio: bytes | None = field(default=None, repr=False)
     audio_type: str = "application/octet-stream"
@@ -43,7 +37,6 @@ class Ticket:
             created_at=self.created_at,
             updated_at=self.updated_at,
             expires_at=self.expires_at,
-            result=self.result,
             error=self.error,
             delivery=self.delivery,
         )
@@ -67,19 +60,15 @@ class LeaseLost(Exception):
 
 
 class TicketStore:
-    """In-memory ticket registry. Single replica only: tickets die with the process."""
+    """In-memory ticket registry. Single replica only: tickets die with the process.
 
-    def __init__(
-        self,
-        ttl_s: int,
-        tombstone_ttl_s: int,
-        deliver: Callable[[DropTarget, dict], Awaitable[bool]] | None = None,
-        lease_s: float = 120,
-        max_attempts: int = 3,
-    ):
+    A ticket holds the upload until a worker finishes with it, then only a status. Results never pass
+    through here: the worker seals them into the user's vault.
+    """
+
+    def __init__(self, ttl_s: int, tombstone_ttl_s: int, lease_s: float = 120, max_attempts: int = 3):
         self._lease_s = lease_s
         self._max_attempts = max_attempts
-        self._deliver = deliver
         self._ttl = ttl_s
         self._tombstone_ttl = tombstone_ttl_s
         self._tickets: dict[str, Ticket] = {}
@@ -120,10 +109,7 @@ class TicketStore:
         return entry is not None and presented is not None and same(digest(presented), entry[1])
 
     def delete(self, ticket_id: str) -> bool:
-        ticket = self._tickets.pop(ticket_id, None)
-        if ticket and ticket.task:
-            ticket.task.cancel()
-        return ticket is not None
+        return self._tickets.pop(ticket_id, None) is not None
 
     async def _set_status(self, ticket: Ticket, status: Status, **fields) -> None:
         async with self._changed:
@@ -216,60 +202,14 @@ class TicketStore:
         ticket = self._leased(lease_id)
         await self._set_status(ticket, status, lease_expires_at=time.time() + self._lease_s)
 
-    async def finish(self, lease_id: str, delivery: str, result: CaptureResult | None) -> None:
+    async def finish(self, lease_id: str) -> None:
+        """The worker deposited the sealed result in the vault: the ticket only records that."""
         ticket = self._leased(lease_id)
-        await self._set_status(
-            ticket, Status.done, result=result, delivery=delivery, audio=None, lease_id=None
-        )
+        await self._set_status(ticket, Status.done, delivery="delivered", audio=None, lease_id=None)
 
     async def fail(self, lease_id: str, error: str) -> None:
         ticket = self._leased(lease_id)
         await self._set_status(ticket, Status.failed, error=error, audio=None, lease_id=None)
-
-    def start(self, ticket: Ticket, delay_s: float, outcome: Status) -> None:
-        ticket.task = asyncio.create_task(self._run(ticket, delay_s, outcome))
-
-    async def _run(self, ticket: Ticket, delay_s: float, outcome: Status) -> None:
-        step = delay_s / 3
-        await asyncio.sleep(step)
-        await self._set_status(ticket, Status.transcribing)
-        await asyncio.sleep(step)
-        await self._set_status(ticket, Status.extracting)
-        await asyncio.sleep(step)
-        failed = outcome == Status.failed
-        result = None if failed else static_result()
-        error = "simulated failure" if failed else None
-        delivery = await self._deposit(ticket, outcome, result, error)
-        await self._set_status(
-            ticket,
-            outcome,
-            error=error,
-            # What was sealed into the vault is not kept here.
-            result=None if delivery == "delivered" else result,
-            delivery=delivery,
-        )
-
-    async def _deposit(self, ticket: Ticket, status: Status, result, error: str | None) -> str:
-        """Seal the outcome into the user's vault. The ticket turns terminal only after this, so
-        `done` with `delivery == "delivered"` means the data is already in the cloud."""
-        if ticket.drop is None or self._deliver is None:
-            return "none"
-        payload = {
-            "v": PAYLOAD_VERSION,
-            "record_id": ticket.drop.record_id,
-            "ticket_id": ticket.id,
-            "status": status.value,
-            "result": result.model_dump() if result else None,
-            "error": error,
-            "completed_at": time.time(),
-        }
-        try:
-            return "delivered" if await self._deliver(ticket.drop, payload) else "failed"
-        except Exception:
-            # Whatever went wrong while sealing or sending, the ticket must still finish: the result
-            # stays on it as the fallback instead of the task dying and the ticket hanging until expiry.
-            log.exception("vault delivery crashed for ticket %s", ticket.id)
-            return "failed"
 
     def sweep(self) -> None:
         for ticket_id in list(self._tickets):
@@ -287,8 +227,3 @@ class TicketStore:
         if ticket and ticket.expires_at <= time.time():
             self.delete(ticket_id)
             self._tombstones[ticket_id] = (time.time() + self._tombstone_ttl, digest(ticket.secret))
-
-    def cancel_all(self) -> None:
-        for ticket in self._tickets.values():
-            if ticket.task:
-                ticket.task.cancel()
