@@ -26,8 +26,10 @@ This service is a small queue and ticket store. The "Invariants" section of `CLA
 
 - [ ] This does not require the service to transcribe or analyse recordings or photos itself: that
       work belongs to the worker.
-- [ ] This does not require writing recordings, photos or results to disk or to a database: tickets
-      live in memory by design.
+- [ ] This does not require the service to receive or keep a result: results go from the worker
+      straight to the user's vault.
+- [ ] This does not require writing recordings or photos to disk or to a database: tickets live in
+      memory by design.
 - [ ] This does not require a key that can read the vault: only write-only drop tokens are used.
 - [ ] This does not reveal whether a worker is connected.
 

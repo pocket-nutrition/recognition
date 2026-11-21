@@ -16,7 +16,10 @@ The route you called and how, for example a `curl` command. Replace every key, t
 with a placeholder.
 
 ```bash
-curl -H 'Authorization: Bearer <redacted>' -F "audio=@meal.m4a;type=audio/mp4" https://your-server/captures
+curl -H 'Authorization: Bearer <redacted>' -F "audio=@meal.m4a;type=audio/mp4" \
+  -F vault_url=https://your-vault -F vault_token=<redacted> \
+  -F vault_record_id=<record id> -F inbox_public_key=<base64 X25519> \
+  https://your-server/captures
 ```
 
 Do not attach real meal recordings or photos: reproduce with a synthetic file if you can.
@@ -37,7 +40,6 @@ What you expected instead, and why.
 - Service version: the image tag (for example `2026.11.1`) or `git rev-parse HEAD`
 - Python version, if you run it from source: `python --version`
 - How you ran it: `uvicorn` locally / Docker image / other
-- Pipeline: `RECOGNITION_PIPELINE` is `worker` or `simulator`
 - Worker version, if a worker is involved (`recognition-worker-osx`)
 - Reverse proxy in front of the server, if any
 

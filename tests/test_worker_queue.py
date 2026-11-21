@@ -1,45 +1,14 @@
 import asyncio
-import base64
 
 import httpx
 import pytest
-from nacl.public import PrivateKey
 
 from app.config import Settings
 from app.main import create_app
-from tests.conftest import API_KEY, AUDIO, AUTH
+from tests.conftest import API_KEY, AUDIO, AUTH, DROP_FORM, WORKER, WORKER_KEY, claim, make_settings, phone_view, submit
 
-WORKER_KEY = "worker-key-0123456789"
-WORKER = {"Authorization": f"Bearer {WORKER_KEY}"}
-DROP_FORM = {
-    "vault_url": "http://vault.test",
-    "vault_token": "pnv_drop",
-    "vault_record_id": "capture-1",
-    "inbox_public_key": base64.b64encode(bytes(PrivateKey.generate().public_key)).decode(),
-}
-RESULT = {
-    "transcript": "une pomme",
-    "language": "fr",
-    "items": [
-        {
-            "raw_text": "une pomme",
-            "quantity": 1,
-            "unit": "piece",
-            "cooking_method": None,
-            "candidates": [{"ingredient_id": "pomme_crue", "name": "Apple, raw", "score": 0.9}],
-        }
-    ],
-}
-
-
-def make_settings(**overrides) -> Settings:
-    return Settings(
-        api_key=API_KEY,
-        pipeline="worker",
-        worker_key=WORKER_KEY,
-        vault_allow_insecure=True,
-        **overrides,
-    )
+RESULT = {"transcript": "une pomme", "language": "fr", "items": []}
+DELIVERED = {"delivery": "delivered"}
 
 
 @pytest.fixture
@@ -48,20 +17,6 @@ async def client():
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
             yield c
-
-
-async def submit(client, **form) -> dict:
-    resp = await client.post("/captures", headers=AUTH, files=AUDIO, data=form)
-    assert resp.status_code == 202, resp.text
-    return resp.json()
-
-
-async def claim(client, wait: float = 0) -> httpx.Response:
-    return await client.post(f"/worker/claim?wait={wait}", headers=WORKER)
-
-
-async def phone_view(client, ticket_id: str) -> dict:
-    return (await client.get(f"/captures/{ticket_id}", headers=AUTH)).json()
 
 
 async def test_capture_waits_in_the_queue_until_a_worker_takes_it(client):
@@ -75,7 +30,7 @@ async def test_claim_on_an_empty_queue_returns_204(client):
 
 
 async def test_claim_hands_out_the_job_with_its_audio_and_drop_target(client):
-    ticket = await submit(client, **DROP_FORM)
+    ticket = await submit(client)
     job = (await claim(client)).json()
 
     assert job["ticket_id"] == ticket["id"]
@@ -93,7 +48,7 @@ async def test_claim_hands_out_the_job_with_its_audio_and_drop_target(client):
 
 async def test_a_photo_reaches_the_worker_with_its_image_type(client):
     photo = {"audio": ("meal.jpg", b"\xff\xd8photo", "image/jpeg")}
-    assert (await client.post("/captures", headers=AUTH, files=photo)).status_code == 202
+    await submit(client, files=photo)
     job = (await claim(client)).json()
 
     assert job["audio_content_type"] == "image/jpeg"
@@ -120,7 +75,7 @@ async def test_phone_key_cannot_use_worker_routes_and_worker_key_cannot_read_tic
     assert (await client.post("/worker/claim", headers=AUTH)).status_code == 401
     assert (await client.post("/worker/claim")).status_code == 401
     assert (await client.get(f"/captures/{ticket['id']}", headers=WORKER)).status_code == 401
-    assert (await client.post("/captures", headers=WORKER, files=AUDIO)).status_code == 401
+    assert (await client.post("/captures", headers=WORKER, files=AUDIO, data=DROP_FORM)).status_code == 401
 
 
 async def test_progress_is_visible_to_the_phone(client):
@@ -139,48 +94,32 @@ async def test_progress_rejects_terminal_statuses(client):
     assert resp.status_code == 422
 
 
-async def test_complete_without_a_vault_keeps_the_result_on_the_ticket(client):
+async def test_complete_marks_the_ticket_delivered_and_keeps_nothing(client):
     ticket = await submit(client)
     lease = (await claim(client)).json()["lease_id"]
-    resp = await client.post(
-        f"/worker/leases/{lease}/complete", headers=WORKER, json={"delivery": "none", "result": RESULT}
-    )
-    assert resp.status_code == 204
+    assert (await client.post(f"/worker/leases/{lease}/complete", headers=WORKER, json=DELIVERED)).status_code == 204
     done = await phone_view(client, ticket["id"])
-    assert done["status"] == "done" and done["delivery"] == "none" and done["result"] == RESULT
+    assert done["status"] == "done" and done["delivery"] == "delivered"
+    assert "result" not in done
 
 
-async def test_delivered_result_is_not_kept_and_must_not_be_sent(client):
-    ticket = await submit(client, **DROP_FORM)
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"delivery": "delivered", "result": RESULT},
+        {"delivery": "none", "result": RESULT},
+        {"delivery": "failed", "result": RESULT},
+        {"delivery": "none"},
+        {"result": RESULT},
+        {},
+    ],
+)
+async def test_a_result_can_never_be_sent_back(client, body):
+    ticket = await submit(client)
     lease = (await claim(client)).json()["lease_id"]
-
-    leaked = await client.post(
-        f"/worker/leases/{lease}/complete", headers=WORKER, json={"delivery": "delivered", "result": RESULT}
-    )
-    assert leaked.status_code == 422
-
-    ok = await client.post(f"/worker/leases/{lease}/complete", headers=WORKER, json={"delivery": "delivered"})
-    assert ok.status_code == 204
-    done = await phone_view(client, ticket["id"])
-    assert done["status"] == "done" and done["delivery"] == "delivered" and done["result"] is None
-
-
-async def test_complete_needs_a_result_unless_it_was_delivered(client):
-    await submit(client, **DROP_FORM)
-    lease = (await claim(client)).json()["lease_id"]
-    for body in ({"delivery": "none"}, {"delivery": "failed"}):
-        resp = await client.post(f"/worker/leases/{lease}/complete", headers=WORKER, json=body)
-        assert resp.status_code == 422
-
-
-async def test_failed_delivery_falls_back_to_the_result_on_the_ticket(client):
-    ticket = await submit(client, **DROP_FORM)
-    lease = (await claim(client)).json()["lease_id"]
-    await client.post(
-        f"/worker/leases/{lease}/complete", headers=WORKER, json={"delivery": "failed", "result": RESULT}
-    )
-    done = await phone_view(client, ticket["id"])
-    assert done["delivery"] == "failed" and done["result"] == RESULT
+    resp = await client.post(f"/worker/leases/{lease}/complete", headers=WORKER, json=body)
+    assert resp.status_code == 422
+    assert (await phone_view(client, ticket["id"]))["status"] == "queued"
 
 
 async def test_fail_marks_the_ticket_failed(client):
@@ -198,7 +137,7 @@ async def test_a_finished_lease_is_dead_and_the_audio_is_gone(client):
     await client.post(f"/worker/leases/{lease}/fail", headers=WORKER, json={"error": "x"})
     assert (await client.get(f"/worker/leases/{lease}/audio", headers=WORKER)).status_code == 409
     assert (
-        await client.post(f"/worker/leases/{lease}/complete", headers=WORKER, json={"delivery": "none", "result": RESULT})
+        await client.post(f"/worker/leases/{lease}/complete", headers=WORKER, json=DELIVERED)
     ).status_code == 409
 
 
@@ -239,7 +178,7 @@ async def test_an_abandoned_job_goes_back_to_the_queue_with_a_new_lease():
             assert second["ticket_id"] == ticket["id"] and second["lease_id"] != first["lease_id"]
             assert (await phone_view(c, ticket["id"]))["status"] == "queued"
             stale = await c.post(
-                f"/worker/leases/{first['lease_id']}/complete", headers=WORKER, json={"delivery": "none", "result": RESULT}
+                f"/worker/leases/{first['lease_id']}/complete", headers=WORKER, json=DELIVERED
             )
             assert stale.status_code == 409
 
@@ -263,14 +202,14 @@ async def test_queue_is_bounded_by_count_and_size():
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
             await submit(c)
             await submit(c)
-            full = await c.post("/captures", headers=AUTH, files=AUDIO)
+            full = await c.post("/captures", headers=AUTH, files=AUDIO, data=DROP_FORM)
             assert full.status_code == 503 and "retry-after" in full.headers
 
     app = create_app(make_settings(max_queued_bytes=len(AUDIO["audio"][1]) + 1))
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
             await submit(c)
-            assert (await c.post("/captures", headers=AUTH, files=AUDIO)).status_code == 503
+            assert (await c.post("/captures", headers=AUTH, files=AUDIO, data=DROP_FORM)).status_code == 503
 
 
 async def test_a_claimed_job_still_counts_against_the_queue_until_it_finishes():
@@ -279,22 +218,16 @@ async def test_a_claimed_job_still_counts_against_the_queue_until_it_finishes():
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
             await submit(c)
             lease = (await claim(c)).json()["lease_id"]
-            assert (await c.post("/captures", headers=AUTH, files=AUDIO)).status_code == 503
+            assert (await c.post("/captures", headers=AUTH, files=AUDIO, data=DROP_FORM)).status_code == 503
             await c.post(f"/worker/leases/{lease}/fail", headers=WORKER, json={"error": "x"})
             await submit(c)
 
 
-async def test_worker_routes_do_not_exist_in_simulator_mode():
-    app = create_app(Settings(api_key=API_KEY))
-    async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
-            assert (await c.post("/worker/claim", headers=WORKER)).status_code == 404
-
-
-def test_worker_mode_needs_a_distinct_strong_worker_key():
+def test_a_distinct_strong_worker_key_is_required():
     with pytest.raises(ValueError):
-        Settings(api_key=API_KEY, pipeline="worker")
+        Settings(api_key=API_KEY)
     with pytest.raises(ValueError):
-        Settings(api_key="same-key-0123456789", pipeline="worker", worker_key="same-key-0123456789")
+        Settings(api_key="same-key-0123456789", worker_key="same-key-0123456789")
     with pytest.raises(ValueError):
-        Settings(api_key=API_KEY, pipeline="worker", worker_key="short")
+        Settings(api_key=API_KEY, worker_key="short")
+    Settings(api_key=API_KEY, worker_key=WORKER_KEY)

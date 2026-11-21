@@ -10,8 +10,8 @@ from app.store import Expired, Ticket, TicketStore, same
 from app.vault import (
     DropTarget,
     InvalidDropTarget,
-    VaultDeliverer,
     VaultUnreachable,
+    VaultVerifier,
     check_vault_url,
     parse_public_key,
 )
@@ -27,8 +27,8 @@ def get_store(request: Request) -> TicketStore:
     return request.app.state.store
 
 
-def get_deliverer(request: Request) -> VaultDeliverer:
-    return request.app.state.deliverer
+def get_verifier(request: Request) -> VaultVerifier:
+    return request.app.state.verifier
 
 
 def _bearer(authorization: str | None) -> str | None:
@@ -62,14 +62,11 @@ def _read_ticket(store: TicketStore, settings: Settings, ticket_id: str, authori
     return ticket
 
 
-async def _parse_drop(settings: Settings, url, token, record_id, public_key) -> DropTarget | None:
-    fields = (url, token, record_id, public_key)
-    if not any(fields):
-        return None
-    if not all(fields):
+async def _parse_drop(settings: Settings, url, token, record_id, public_key) -> DropTarget:
+    if not all((url, token, record_id, public_key)):
         raise HTTPException(
             status_code=422,
-            detail="vault_url, vault_token, vault_record_id and inbox_public_key go together",
+            detail="vault_url, vault_token, vault_record_id and inbox_public_key are required",
         )
     try:
         return DropTarget(
@@ -97,32 +94,27 @@ async def create_capture(
     response: Response,
     settings: Annotated[Settings, Depends(get_settings)],
     store: Annotated[TicketStore, Depends(get_store)],
-    deliverer: Annotated[VaultDeliverer, Depends(get_deliverer)],
+    verifier: Annotated[VaultVerifier, Depends(get_verifier)],
     authorization: Annotated[str | None, Header()] = None,
     mode: Annotated[str, Form(pattern="^(sync|async)$")] = "async",
     vault_url: Annotated[str | None, Form()] = None,
     vault_token: Annotated[str | None, Form()] = None,
     vault_record_id: Annotated[str | None, Form(pattern=r"^[A-Za-z0-9_-]{1,64}$")] = None,
     inbox_public_key: Annotated[str | None, Form()] = None,
-    simulate_delay_s: Annotated[float | None, Form(ge=0)] = None,
-    simulate_outcome: Annotated[Status, Form()] = Status.done,
 ):
     """Upload an audio clip (or a meal photo, JPEG/PNG, same field) and get a ticket back.
 
-    `mode=async` (default) returns 202 immediately. `mode=sync` waits up to
-    `sync_timeout_s` for the result and returns 200, or 202 if still running.
-    `simulate_*` fields only exist for the POC (static results).
+    `mode=async` (default) returns 202 immediately. `mode=sync` waits up to `sync_timeout_s` for the
+    ticket to end and returns 200, or 202 if still running.
 
-    Optional vault delivery: pass all of `vault_url`, `vault_token` (a write-only drop token),
-    `vault_record_id` and `inbox_public_key`. The result is then sealed to that key and deposited
-    in the vault, and the ticket reports `delivery` instead of keeping the result.
+    The vault drop target is required: `vault_url`, `vault_token` (a write-only drop token),
+    `vault_record_id` and `inbox_public_key`. The worker seals the result to that key and deposits it in
+    the vault; this service never sees it. Without a shared key, the drop token is the credential.
     """
     drop = await _parse_drop(settings, vault_url, vault_token, vault_record_id, inbox_public_key)
-    token = drop.token if drop else None
+    token: str | None = drop.token
     if not _is_api_key(settings, _bearer(authorization)):
         # No shared key: the dictation is authenticated by its drop token, which the vault vouches for.
-        if drop is None:
-            raise HTTPException(status_code=401, detail="invalid or missing credentials")
         if (urlsplit(drop.url).hostname or "").lower() not in settings.trusted_vault_hosts:
             raise HTTPException(status_code=401, detail="vault not accepted by this server")
         started = store.token_binding(drop.token)
@@ -136,7 +128,7 @@ async def create_capture(
                 raise HTTPException(status_code=409, detail="drop token already used")
             return _created(earlier)
         try:
-            alive = await deliverer.verify_drop_token(drop)
+            alive = await verifier.verify_drop_token(drop)
         except VaultUnreachable:
             raise HTTPException(
                 status_code=503, detail="vault unreachable, retry later", headers={"Retry-After": "10"}
@@ -151,27 +143,14 @@ async def create_capture(
     data = await audio.read(settings.max_audio_bytes + 1)
     if len(data) > settings.max_audio_bytes:
         raise HTTPException(status_code=413, detail="audio too large")
-    if simulate_outcome not in TERMINAL:
-        raise HTTPException(status_code=422, detail="simulate_outcome must be done or failed")
-
-    delay = min(
-        settings.default_delay_s if simulate_delay_s is None else simulate_delay_s,
-        settings.max_delay_s,
-    )
-    if settings.pipeline == "worker":
-        queued, queued_bytes = store.queue_load()
-        if queued >= settings.max_queued or queued_bytes + len(data) > settings.max_queued_bytes:
-            raise HTTPException(
-                status_code=503, detail="queue is full, retry later", headers={"Retry-After": "60"}
-            )
+    queued, queued_bytes = store.queue_load()
+    if queued >= settings.max_queued or queued_bytes + len(data) > settings.max_queued_bytes:
+        raise HTTPException(status_code=503, detail="queue is full, retry later", headers={"Retry-After": "60"})
     ticket = store.create()
     ticket.drop = drop
     if token is not None:
         store.bind_token(token, ticket.id)
-    if settings.pipeline == "worker":
-        await store.enqueue(ticket, data, audio.content_type)
-    else:
-        store.start(ticket, delay, simulate_outcome)
+    await store.enqueue(ticket, data, audio.content_type)
     response.headers["Location"] = f"/captures/{ticket.id}"
 
     if mode == "sync":
